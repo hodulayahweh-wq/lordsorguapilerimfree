@@ -1,7 +1,9 @@
 import os
 import json
 import re
+import zipfile
 from fastapi import FastAPI, Request, HTTPException
+from starlette.responses import Response
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -14,7 +16,7 @@ from telegram.ext import (
 # ──────────────────────────────────────────────
 # Ortam değişkenleri (Render → Environment Variables kısmına ekle)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-BASE_URL = os.environ.get("BASE_URL")          # Ör: https://lordapiv3-abc123.onrender.com
+BASE_URL = os.environ.get("BASE_URL")          # Ör: https://lordapiv3.onrender.com
 
 if not BOT_TOKEN or not BASE_URL:
     raise RuntimeError("BOT_TOKEN ve BASE_URL ortam değişkenleri tanımlı değil!")
@@ -43,7 +45,7 @@ def clean_name(name: str) -> str:
 
 # ──────────────────────────────────────────────
 # FastAPI
-app = FastAPI(title="LordApiV3 - TXT → Search API")
+app = FastAPI(title="LordApiV3 - Dosya/Klasör → Search API")
 
 # ──────────────────────────────────────────────
 # Telegram Application (global, tek sefer initialize edilecek)
@@ -53,7 +55,7 @@ application = Application.builder().token(BOT_TOKEN).build()
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "✅ Sistem aktif\n\n"
-        "📂 TXT dosya gönder → otomatik API oluşur\n"
+        "📂 TXT veya ZIP (klasör) dosya gönder → otomatik API oluşur\n"
         "📌 Komutlar: /listele  /sil  /kapat  /ac"
     )
 
@@ -62,21 +64,55 @@ async def file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     doc = update.message.document
-    if not doc.file_name.lower().endswith(".txt"):
-        await update.message.reply_text("Sadece .txt dosyası kabul edilir.")
-        return
-
-    name = clean_name(doc.file_name.replace(".txt", ""))
-    path = os.path.join(DATA_DIR, f"{name}.txt")
+    file_name = doc.file_name.lower()
+    original_name = clean_name(doc.file_name.replace(".txt", "").replace(".zip", ""))
 
     file = await doc.get_file()
-    await file.download_to_drive(path)
+    temp_path = os.path.join(DATA_DIR, doc.file_name)
+    await file.download_to_drive(temp_path)
 
     state = load_state()
-    state[name] = {"active": True}
+    created_apis = []
+
+    if file_name.endswith(".zip"):
+        # ZIP ise unzip et, içindeki TXT'leri işle
+        unzip_dir = os.path.join(DATA_DIR, original_name)
+        os.makedirs(unzip_dir, exist_ok=True)
+        with zipfile.ZipFile(temp_path, 'r') as zip_ref:
+            zip_ref.extractall(unzip_dir)
+        
+        for root, _, files in os.walk(unzip_dir):
+            for f in files:
+                if f.lower().endswith(".txt"):
+                    name = clean_name(f.replace(".txt", "")) + "_result"
+                    path = os.path.join(DATA_DIR, f"{name}.txt")
+                    src_path = os.path.join(root, f)
+                    os.rename(src_path, path)  # Taşı
+                    state[name] = {"active": True, "source": "zip"}
+                    created_apis.append(name)
+        
+        os.remove(temp_path)  # Temp zip sil
+    elif file_name.endswith(".txt"):
+        # Tek TXT
+        name = original_name + "_result"
+        path = os.path.join(DATA_DIR, f"{name}.txt")
+        os.rename(temp_path, path)
+        state[name] = {"active": True, "source": "txt"}
+        created_apis.append(name)
+    else:
+        os.remove(temp_path)
+        await update.message.reply_text("Sadece .txt veya .zip dosyası kabul edilir.")
+        return
+
     save_state(state)
 
-    await update.message.reply_text(f"✅ API oluşturuldu:\n{BASE_URL}/search/{name}")
+    if created_apis:
+        msg = "✅ API(ler) oluşturuldu:\n"
+        for api in created_apis:
+            msg += f"{BASE_URL}/search/{api}?q=ornek_arama\n"
+        await update.message.reply_text(msg)
+    else:
+        await update.message.reply_text("ZIP içinde TXT bulunamadı.")
 
 async def listele(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
@@ -165,8 +201,10 @@ async def search(dataset: str, q: str = ""):
                 break
 
     if len(results) > 100:
-        return {"result": "too_large", "count": len(results)}
-
+        # Çok veri varsa TXT olarak dön
+        content = "\n".join(results)
+        return Response(content=content, media_type="text/plain", headers={"Content-Disposition": "attachment; filename=results.txt"})
+    
     return {"count": len(results), "data": results}
 
 # ──────────────────────────────────────────────
