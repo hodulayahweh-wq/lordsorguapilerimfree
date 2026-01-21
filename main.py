@@ -5,7 +5,7 @@ import zipfile
 import asyncio
 from fastapi import FastAPI, Request, HTTPException
 from starlette.responses import Response
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -15,6 +15,7 @@ from telegram.ext import (
 )
 
 # ──────────────────────────────────────────────
+# Ortam değişkenleri (Render → Environment Variables)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 BASE_URL = os.environ.get("BASE_URL")
 
@@ -44,11 +45,11 @@ def clean_name(name: str) -> str:
     return name
 
 # ──────────────────────────────────────────────
-app = FastAPI(title="LordApiV3")
+app = FastAPI(title="LordApiV3 - Dosya → Arama API")
 
 application = Application.builder().token(BOT_TOKEN).build()
 
-# ───── Yardımcı fonksiyon: progress mesajı güncelle ─────
+# ───── Progress mesajı güncelleme ─────
 async def update_progress_message(message, percent: int, text_prefix="İşleniyor"):
     bar_length = 12
     filled = int(bar_length * percent / 100)
@@ -57,7 +58,7 @@ async def update_progress_message(message, percent: int, text_prefix="İşleniyo
     try:
         await message.edit_text(new_text, parse_mode="Markdown")
     except:
-        pass  # Telegram rate limit veya mesaj silinmişse geç
+        pass
 
 # ───── Dosya yükleme + progress ─────
 async def file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -70,13 +71,10 @@ async def file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     progress_msg = await update.message.reply_text("📥 Dosya indiriliyor... % 0\n`░░░░░░░░░░░░`")
 
-    # Dosyayı indirirken progress simüle et (gerçek byte progress için bot API sınırlı)
     file = await doc.get_file()
     temp_path = os.path.join(DATA_DIR, f"temp_{doc.file_id}")
-    
-    # İndirme simülasyonu (gerçekte byte bazlı yapmak zor, basitçe zamanla artırıyoruz)
-    await update_progress_message(progress_msg, 10, "Dosya indiriliyor")
 
+    await update_progress_message(progress_msg, 10, "Dosya indiriliyor")
     await file.download_to_drive(temp_path)
     await update_progress_message(progress_msg, 30, "Dosya indirildi, işleniyor")
 
@@ -111,13 +109,16 @@ async def file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 # Temizlik
                 for root, dirs, files in os.walk(unzip_dir, topdown=False):
-                    for name in files: os.remove(os.path.join(root, name))
-                    for name in dirs: os.rmdir(os.path.join(root, name))
+                    for name in files:
+                        os.remove(os.path.join(root, name))
+                    for name in dirs:
+                        os.rmdir(os.path.join(root, name))
                 os.rmdir(unzip_dir)
 
         except Exception as e:
             await progress_msg.edit_text(f"Hata: ZIP açılamadı → {str(e)}")
-            os.remove(temp_path)
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
             return
 
     elif file_name.endswith(".txt"):
@@ -127,17 +128,20 @@ async def file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         os.replace(temp_path, target_path)
         state[api_name] = {"active": True, "source": "txt"}
         created_apis.append(api_name)
+
     else:
-        os.remove(temp_path)
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
         await progress_msg.edit_text("Sadece .txt veya .zip kabul edilir.")
         return
 
-    os.remove(temp_path) if os.path.exists(temp_path) else None
+    if os.path.exists(temp_path):
+        os.remove(temp_path)
 
     if created_apis:
         save_state(state)
         await update_progress_message(progress_msg, 100, "Tamamlandı")
-        await asyncio.sleep(1.2)  # kullanıcı görsün
+        await asyncio.sleep(1.2)
 
         msg = "✅ API'ler hazır!\n\n"
         for api in created_apis:
@@ -146,17 +150,83 @@ async def file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await progress_msg.edit_text("İşlenecek .txt dosyası bulunamadı.")
 
-# Diğer handler'lar aynı kalıyor (start, listele, kapat, ac, sil)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "✅ Sistem çalışıyor\n"
-        "📄 .txt veya .zip at → otomatik API oluşur\n"
+        "📄 .txt veya .zip (içinde txt dosyaları olan) atın\n"
         "Büyük dosyalarda % ilerleme gösterilir\n\n"
-        "Komutlar: /listele /sil /kapat /ac"
+        "Komutlar:\n/listele\n/sil <apiadı>\n/kapat <apiadı>\n/ac <apiadı>"
     )
 
-# ... (listele, kapat, ac, sil fonksiyonları öncekiyle aynı)
 
+async def listele(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state = load_state()
+    if not state:
+        await update.message.reply_text("❌ Henüz oluşturulmuş API yok.")
+        return
+
+    msg = "Mevcut API'ler:\n\n"
+    for k, v in state.items():
+        durum = "🟢 Açık" if v.get("active", False) else "🔴 Kapalı"
+        msg += f"• {k} → {durum}\n"
+
+    await update.message.reply_text(msg.strip() or "Liste boş.")
+
+
+async def kapat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Kullanım: /kapat <api_adi>")
+        return
+
+    api = clean_name(context.args[0])
+    state = load_state()
+
+    if api in state:
+        state[api]["active"] = False
+        save_state(state)
+        await update.message.reply_text(f"🔴 {api} kapatıldı.")
+    else:
+        await update.message.reply_text(f"❌ '{api}' isminde API bulunamadı.")
+
+
+async def ac(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Kullanım: /ac <api_adi>")
+        return
+
+    api = clean_name(context.args[0])
+    state = load_state()
+
+    if api in state:
+        state[api]["active"] = True
+        save_state(state)
+        await update.message.reply_text(f"🟢 {api} açıldı.")
+    else:
+        await update.message.reply_text(f"❌ '{api}' isminde API bulunamadı.")
+
+
+async def sil(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Kullanım: /sil <api_adi>")
+        return
+
+    api = clean_name(context.args[0])
+    state = load_state()
+
+    if api in state:
+        state.pop(api, None)
+        save_state(state)
+        try:
+            os.remove(os.path.join(DATA_DIR, f"{api}.txt"))
+        except FileNotFoundError:
+            pass
+        await update.message.reply_text(f"🗑️ {api} silindi.")
+    else:
+        await update.message.reply_text(f"❌ '{api}' isminde API bulunamadı.")
+
+
+# ───── Handler'lar ─────
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("listele", listele))
 application.add_handler(CommandHandler("kapat", kapat))
@@ -164,7 +234,71 @@ application.add_handler(CommandHandler("ac", ac))
 application.add_handler(CommandHandler("sil", sil))
 application.add_handler(MessageHandler(filters.Document.ALL, file_upload))
 
-# Search endpoint ve webhook kısmı değişmedi (önceki mesajdakiyle aynı)
 
-# ──────────────────────────────────────────────
-# (search endpoint, startup, shutdown, webhook, root endpoint'leri önceki kodla aynı)
+# ───── Arama Endpoint ─────
+@app.get("/search/{dataset}")
+async def search(dataset: str, q: str = ""):
+    dataset = clean_name(dataset)
+    state = load_state()
+
+    if dataset not in state or not state[dataset].get("active", False):
+        raise HTTPException(status_code=404, detail="API kapalı veya mevcut değil")
+
+    path = os.path.join(DATA_DIR, f"{dataset}.txt")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Veri dosyası bulunamadı")
+
+    results = []
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if line and q.lower() in line.lower():
+                results.append(line)
+            if len(results) >= 1000:
+                break
+
+    if len(results) > 100:
+        content = "\n".join(results)
+        return Response(
+            content=content,
+            media_type="text/plain",
+            headers={"Content-Disposition": f"attachment; filename={dataset}_results.txt"}
+        )
+
+    return {"count": len(results), "data": results}
+
+
+# ───── Webhook & Yaşam döngüsü ─────
+@app.on_event("startup")
+async def on_startup():
+    await application.initialize()
+    webhook_url = f"{BASE_URL.rstrip('/')}/webhook"
+    await application.bot.set_webhook(
+        url=webhook_url,
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True
+    )
+    print(f"Webhook ayarlandı: {webhook_url}")
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    await application.stop()
+    await application.shutdown()
+
+
+@app.post("/webhook")
+async def webhook(request: Request):
+    try:
+        data = await request.json()
+        update = Update.de_json(data, application.bot)
+        if update:
+            await application.process_update(update)
+    except Exception:
+        pass
+    return {"ok": True}
+
+
+@app.get("/")
+async def root():
+    return {"status": "online"}
