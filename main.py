@@ -15,7 +15,7 @@ from telegram.ext import (
 )
 
 # ──────────────────────────────────────────────
-# Ortam değişkenleri (Render → Environment Variables)
+# Ortam değişkenleri
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 BASE_URL = os.environ.get("BASE_URL")
 
@@ -45,125 +45,143 @@ def clean_name(name: str) -> str:
     return name
 
 # ──────────────────────────────────────────────
-app = FastAPI(title="LordApiV3 - Dosya → Arama API")
+app = FastAPI(title="LordApiV3 - Arama API")
 
 application = Application.builder().token(BOT_TOKEN).build()
 
-# ───── Progress mesajı güncelleme ─────
-async def update_progress_message(message, percent: int, text_prefix="İşleniyor"):
-    bar_length = 12
-    filled = int(bar_length * percent / 100)
-    bar = "█" * filled + "░" * (bar_length - filled)
-    new_text = f"{text_prefix} % {percent}\n`{bar}`"
+# ───── Progress göstergesi ─────
+async def update_progress(message, percent: int, prefix="İşleniyor"):
+    bar = "█" * (percent // 10) + "░" * (10 - percent // 10)
     try:
-        await message.edit_text(new_text, parse_mode="Markdown")
+        await message.edit_text(f"{prefix} %{percent}\n`{bar}`", parse_mode="Markdown")
     except:
         pass
 
-# ───── Dosya yükleme + progress ─────
+# ───── Txt içeriklerini birleştir ─────
+def combine_txt_contents(file_paths: list[str]) -> str:
+    parts = []
+    for path in file_paths:
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read().rstrip()
+                if content:
+                    parts.append(content)
+        except:
+            continue
+    return "\n\n".join(parts) + "\n"
+
+# ───── Dosya yükleme ─────
 async def file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.document:
         return
 
     doc = update.message.document
     file_name = doc.file_name.lower()
-    base_name = clean_name(doc.file_name.rsplit(".", 1)[0])
+    base_name = clean_name(doc.file_name.rsplit(".", 1)[0] or "veri")
 
-    progress_msg = await update.message.reply_text("📥 Dosya indiriliyor... % 0\n`░░░░░░░░░░░░`")
+    progress = await update.message.reply_text("📥 Başlıyor... %0\n`░░░░░░░░░░`")
 
     file = await doc.get_file()
-    temp_path = os.path.join(DATA_DIR, f"temp_{doc.file_id}")
+    temp_path = os.path.join(DATA_DIR, f"tmp_{doc.file_id[:12]}")
 
-    await update_progress_message(progress_msg, 10, "Dosya indiriliyor")
+    await update_progress(progress, 15, "İndiriliyor")
     await file.download_to_drive(temp_path)
-    await update_progress_message(progress_msg, 30, "Dosya indirildi, işleniyor")
+    await update_progress(progress, 35, "İndirildi")
 
     state = load_state()
-    created_apis = []
+    api_name = base_name + "_result"
+    target_path = os.path.join(DATA_DIR, f"{api_name}.txt")
+
+    txt_files = []
+
+    unzip_dir = None
 
     if file_name.endswith(".zip"):
-        unzip_dir = os.path.join(DATA_DIR, f"unzip_{base_name}_{doc.file_id[:8]}")
+        await update_progress(progress, 45, "ZIP açılıyor")
+        unzip_dir = os.path.join(DATA_DIR, f"uz_{doc.file_id[:8]}")
         os.makedirs(unzip_dir, exist_ok=True)
 
-        await update_progress_message(progress_msg, 40, "ZIP açılıyor")
-
         try:
-            with zipfile.ZipFile(temp_path, 'r') as zip_ref:
-                total_files = len(zip_ref.namelist())
-                processed = 0
+            with zipfile.ZipFile(temp_path, "r") as z:
+                z.extractall(unzip_dir)
 
-                for member in zip_ref.namelist():
-                    if member.lower().endswith(".txt"):
-                        zip_ref.extract(member, unzip_dir)
-                        processed += 1
-                        percent = 40 + int(50 * processed / max(1, total_files))
-                        await update_progress_message(progress_msg, min(percent, 95))
+            for root, _, files in os.walk(unzip_dir):
+                for fname in files:
+                    if fname.lower().endswith(".txt"):
+                        txt_files.append(os.path.join(root, fname))
 
-                        fname = os.path.basename(member)
-                        api_name = clean_name(fname.rsplit(".", 1)[0]) + "_result"
-                        target_path = os.path.join(DATA_DIR, f"{api_name}.txt")
-                        os.replace(os.path.join(unzip_dir, member), target_path)
-
-                        state[api_name] = {"active": True, "source": "zip"}
-                        created_apis.append(api_name)
-
-                # Temizlik
-                for root, dirs, files in os.walk(unzip_dir, topdown=False):
-                    for name in files:
-                        os.remove(os.path.join(root, name))
-                    for name in dirs:
-                        os.rmdir(os.path.join(root, name))
-                os.rmdir(unzip_dir)
+            await update_progress(progress, 75, "Okunuyor")
 
         except Exception as e:
-            await progress_msg.edit_text(f"Hata: ZIP açılamadı → {str(e)}")
+            await progress.edit_text(f"ZIP hatası: {str(e)[:100]}")
             if os.path.exists(temp_path):
                 os.remove(temp_path)
             return
 
     elif file_name.endswith(".txt"):
-        await update_progress_message(progress_msg, 60, "TXT işleniyor")
-        api_name = base_name + "_result"
-        target_path = os.path.join(DATA_DIR, f"{api_name}.txt")
-        os.replace(temp_path, target_path)
-        state[api_name] = {"active": True, "source": "txt"}
-        created_apis.append(api_name)
+        txt_files = [temp_path]
+        await update_progress(progress, 70, "Okunuyor")
 
     else:
         if os.path.exists(temp_path):
             os.remove(temp_path)
-        await progress_msg.edit_text("Sadece .txt veya .zip kabul edilir.")
+        await progress.edit_text("Sadece .txt veya .zip kabul edilir.")
         return
 
+    if not txt_files:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        await progress.edit_text("Hiç .txt dosyası bulunamadı.")
+        return
+
+    # Birleştir ve kaydet
+    combined = combine_txt_contents(txt_files)
+    with open(target_path, "w", encoding="utf-8") as f:
+        f.write(combined)
+
+    # Temizlik
     if os.path.exists(temp_path):
         os.remove(temp_path)
 
-    if created_apis:
-        save_state(state)
-        await update_progress_message(progress_msg, 100, "Tamamlandı")
-        await asyncio.sleep(1.2)
+    if unzip_dir and os.path.exists(unzip_dir):
+        for root, dirs, files in os.walk(unzip_dir, topdown=False):
+            for name in files:
+                os.remove(os.path.join(root, name))
+            for name in dirs:
+                os.rmdir(os.path.join(root, name))
+        os.rmdir(unzip_dir)
 
-        msg = "✅ API'ler hazır!\n\n"
-        for api in created_apis:
-            msg += f"• {BASE_URL}/search/{api}?q=kelime\n"
-        await progress_msg.edit_text(msg)
-    else:
-        await progress_msg.edit_text("İşlenecek .txt dosyası bulunamadı.")
+    state[api_name] = {"active": True, "source": "combined"}
+    save_state(state)
+
+    await update_progress(progress, 100, "Tamam")
+    await asyncio.sleep(1.1)
+
+    msg = (
+        f"✅ API oluşturuldu\n"
+        f"{BASE_URL}/search/{api_name}?q=aranan_kelime\n\n"
+        f"{len(txt_files)} dosya birleştirildi."
+    )
+    await progress.edit_text(msg)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "✅ Sistem çalışıyor\n"
+        "✅ Sistem aktif\n\n"
         "📄 .txt veya .zip (içinde txt dosyaları olan) atın\n"
-        "Büyük dosyalarda % ilerleme gösterilir\n\n"
-        "Komutlar:\n/listele\n/sil <apiadı>\n/kapat <apiadı>\n/ac <apiadı>"
+        "Tüm içerikler birleştirilir, arama yapılır\n\n"
+        "Komutlar:\n"
+        "/listele\n"
+        "/sil <apiadı>\n"
+        "/kapat <apiadı>\n"
+        "/ac <apiadı>"
     )
 
 
 async def listele(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
     if not state:
-        await update.message.reply_text("❌ Henüz oluşturulmuş API yok.")
+        await update.message.reply_text("❌ Henüz API oluşturulmamış.")
         return
 
     msg = "Mevcut API'ler:\n\n"
@@ -187,7 +205,7 @@ async def kapat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_state(state)
         await update.message.reply_text(f"🔴 {api} kapatıldı.")
     else:
-        await update.message.reply_text(f"❌ '{api}' isminde API bulunamadı.")
+        await update.message.reply_text(f"❌ '{api}' isminde API yok.")
 
 
 async def ac(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -203,7 +221,7 @@ async def ac(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_state(state)
         await update.message.reply_text(f"🟢 {api} açıldı.")
     else:
-        await update.message.reply_text(f"❌ '{api}' isminde API bulunamadı.")
+        await update.message.reply_text(f"❌ '{api}' isminde API yok.")
 
 
 async def sil(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -223,7 +241,7 @@ async def sil(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         await update.message.reply_text(f"🗑️ {api} silindi.")
     else:
-        await update.message.reply_text(f"❌ '{api}' isminde API bulunamadı.")
+        await update.message.reply_text(f"❌ '{api}' isminde API yok.")
 
 
 # ───── Handler'lar ─────
@@ -235,7 +253,7 @@ application.add_handler(CommandHandler("sil", sil))
 application.add_handler(MessageHandler(filters.Document.ALL, file_upload))
 
 
-# ───── Arama Endpoint ─────
+# ───── Arama ─────
 @app.get("/search/{dataset}")
 async def search(dataset: str, q: str = ""):
     dataset = clean_name(dataset)
@@ -251,21 +269,21 @@ async def search(dataset: str, q: str = ""):
     results = []
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
-            line = line.strip()
-            if line and q.lower() in line.lower():
-                results.append(line)
-            if len(results) >= 1000:
+            stripped = line.strip()
+            if stripped and q.lower() in stripped.lower():
+                results.append(stripped)
+            if len(results) >= 1500:
                 break
 
-    if len(results) > 100:
+    if len(results) > 120:
         content = "\n".join(results)
         return Response(
             content=content,
             media_type="text/plain",
-            headers={"Content-Disposition": f"attachment; filename={dataset}_results.txt"}
+            headers={"Content-Disposition": "attachment; filename=sonuclar.txt"}
         )
 
-    return {"count": len(results), "data": results}
+    return {"count": len(results), "results": results}
 
 
 # ───── Webhook & Yaşam döngüsü ─────
